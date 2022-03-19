@@ -60,6 +60,26 @@ void setRow(uint8_t rowIdx){
   digitalWrite(RA2_PIN,r2);
 }
 
+uint8_t readCol(uint8_t Col){
+  digitalWrite(REN_PIN,HIGH);
+  switch(Col){
+    case 0:
+      return digitalRead(C0_PIN);
+      break;
+    case 1:
+      return digitalRead(C1_PIN);
+      break;
+    case 2:
+      return digitalRead(C2_PIN);
+      break;
+    case 3:
+      return digitalRead(C3_PIN);
+      break;
+    default:
+      return 1;
+  }
+  digitalWrite(REN_PIN,LOW);
+}
 uint8_t readCols(){
   digitalWrite(REN_PIN,HIGH);
   uint8_t c0 = digitalRead(C0_PIN), c1 = digitalRead(C1_PIN), c2 = digitalRead(C2_PIN), c3 = digitalRead(C3_PIN);
@@ -67,23 +87,33 @@ uint8_t readCols(){
   digitalWrite(REN_PIN,LOW);
 }
 
+
+
 //defining step size for diferrent notes, Starting at C and ends at B
-const int32_t stepSizes[] = {50953930,54113197,573309352,60740010,6435179,68178356,72232452,76527617,81078186,85899345,105662681,129973076};
+const int32_t stepSizes[] = {50953930,54113197,57330935,60740010,64351798,68178356,72232452,76527617,81078186,85899345,91007185,96418753};
 
 volatile int32_t currentStepSize;
 
+// Mutex created to handle asynchronous accesses to keyArray
+SemaphoreHandle_t keyArrayMutex;
 volatile uint8_t *keyArray = new uint8_t[8];
+volatile uint8_t knob3Rotation = 8;
 
 void updateKeyArray(){
+  xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
+  
   //assertions to be added 
   for ( int i = 0; i < 8 ; i++ ){
     setRow(i);
     delayMicroseconds(3);
     keyArray[i] = readCols();
   }
+
+  xSemaphoreGive(keyArrayMutex);
 }
 
 void checkKeyPress(){
+  xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
   const char* notes[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
   int32_t localStepSize = 0;
 
@@ -105,10 +135,57 @@ void checkKeyPress(){
   }else{
     localStepSize = 0;
   }
+  xSemaphoreGive(keyArrayMutex);
   __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
 }
 
+void decode_knob3(bool isSetUp=false){
+  static uint8_t prevA;
+  static uint8_t prevB;
+  static int8_t prevRes;
+  uint8_t currA;
+  uint8_t currB;
+  int8_t res;
+
+
+  if(isSetUp){
+    setRow(3);
+    delayMicroseconds(3);
+    prevA = readCol(0);
+    prevB = readCol(1);
+    prevRes = 0;
+  }else{
+    setRow(3);
+    delayMicroseconds(3);
+    currA = readCol(0);
+    currB = readCol(1);
+    
+    uint8_t combined = prevA + (prevB << 1) + (currA << 2) + (currB << 3);
+    
+    if( combined == 0b0010 || combined == 0b1011 || combined == 0b1101 || combined == 0b0100){
+      res = 1;
+    }else if(combined == 0b0001 || combined == 0b1000 || combined == 0b1110 || combined == 0b0111){
+      res = -1;
+    }else if(combined == 0b0000||combined == 0b0101||combined == 0b1010|| combined == 0b1111){
+      res = 0;
+    }else{
+      if (prevRes > 0)  res = +2;
+      else if (prevRes < 0) res = -2;
+      else res = 0;
+    }
+
+  }
+  prevA = currA;
+  prevB = currB;
+  prevRes = res;
+
+  if(knob3Rotation + res >=16) __atomic_store_n(&knob3Rotation, 16, __ATOMIC_RELAXED);
+  else if (knob3Rotation + res <= 0) __atomic_store_n(&knob3Rotation, 0, __ATOMIC_RELAXED);
+  else __atomic_store_n(&knob3Rotation, knob3Rotation+res, __ATOMIC_RELAXED);
+}
+
 const char* checkNote(){
+  xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
   const char* notes[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
   int32_t localStepSize = 0;
 
@@ -129,6 +206,7 @@ const char* checkNote(){
     }
   }
 
+  xSemaphoreGive(keyArrayMutex);
   return res;
 }
 
@@ -137,41 +215,59 @@ void scanKeysTask(void * pvParameters) {
   const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
   // Get current time, used in next function call
   TickType_t xLastWakeTime = xTaskGetTickCount();
+
   while (1){
     //Blocks call until xFrequncy time has passed
     vTaskDelayUntil( &xLastWakeTime, xFrequency );
     updateKeyArray();
     checkKeyPress();
+    decode_knob3();
+    Serial.println(knob3Rotation);
   }
 }
 
-void updateDisplay(void * pvParameters){
+void displayUpdateTask(void * pvParameters){
+  // Setting up initiation interval to 50ms
+  const TickType_t xFrequency = 100/portTICK_PERIOD_MS;
+  // Get current time, used in next function call
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1){
+    //Blocks call until xFrequncy time has passed
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
     //Update display
     u8g2.clearBuffer();         // clear the internal memory
     u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-    u8g2.drawStr(2,10,"Hello World!");  // write something to the internal memory
+    // u8g2.drawStr(2,10,"Hello World!");  // write something to the internal memory
 
     const char* note = checkNote();
     u8g2.drawStr(2,30,note);
     u8g2.setCursor(32,30);
     u8g2.print(currentStepSize);
 
+    xSemaphoreTake(keyArrayMutex, portMAX_DELAY);
     for ( int i = 0; i < 8;i++){
       u8g2.setCursor(2+(int)i*10,20);
       u8g2.print(keyArray[i],HEX);
     }
+    xSemaphoreGive(keyArrayMutex);
+
+    u8g2.drawStr(2,10,"Vol:");
+    u8g2.setCursor(32,10);
+    u8g2.print(knob3Rotation);
+
     u8g2.sendBuffer();          // transfer internal memory to the display
 
     //Toggle LED
     digitalToggle(LED_BUILTIN);
+  }
 }
 
 void sampleISR(){
   static int32_t phaseAcc=0;
   phaseAcc += currentStepSize;
   int32_t Vout = phaseAcc >> 24;
-
-  // analogWrite(OUTR_PIN, Vout+128);
+  Vout = Vout >> (8 - knob3Rotation/2);
+  analogWrite(OUTR_PIN, Vout+128);
 }
 
 
@@ -202,6 +298,8 @@ void setup() {
   u8g2.begin();
   setOutMuxBit(DEN_BIT, HIGH);  //Enable display power supply
 
+  //Initialise Knob position;
+  decode_knob3(true);
   //Initialise UART
   Serial.begin(9600);
 
@@ -223,9 +321,21 @@ void setup() {
     "scanKeys", /* Text name for the task */
     64, /* Stack size in words, not bytes */ 
     NULL, /* Parameter passed into the task */
-    1, /* Task priority */
+    2, /* Task priority */
     &scanKeysHandle /* Pointer to store the task handle */
   ); 
+
+  TaskHandle_t displayUpdateHandle = NULL; 
+  xTaskCreate(
+    displayUpdateTask, /* Function that implements the task */ 
+    "displayUpdate", /* Text name for the task */
+    256, /* Stack size in words, not bytes */ 
+    NULL, /* Parameter passed into the task */
+    1, /* Task priority */
+    &displayUpdateHandle /* Pointer to store the task handle */
+  ); 
+
+  keyArrayMutex = xSemaphoreCreateMutex();
 
   vTaskStartScheduler();
 }
@@ -237,8 +347,5 @@ void loop() {
 
   if (millis() > next) {
     next += interval;
-
-    updateDisplay(nullptr);
-  
   }
 }
