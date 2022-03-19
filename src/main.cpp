@@ -2,6 +2,7 @@
 #include <U8g2lib.h>
 #include <assert.h>
 #include <string>
+#include <STM32FreeRTOS.h>
 
 //Constants
   const uint32_t interval = 100; //Display update interval
@@ -71,7 +72,9 @@ const int32_t stepSizes[] = {50953930,54113197,573309352,60740010,6435179,681783
 
 volatile int32_t currentStepSize;
 
-void updateKeyArray(uint8_t* keyArray){
+volatile uint8_t *keyArray = new uint8_t[8];
+
+void updateKeyArray(){
   //assertions to be added 
   for ( int i = 0; i < 8 ; i++ ){
     setRow(i);
@@ -80,13 +83,34 @@ void updateKeyArray(uint8_t* keyArray){
   }
 }
 
-const char* getNote(){
-    const char* notes[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
-    
+void checkKeyPress(){
+  const char* notes[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+  int32_t localStepSize = 0;
+
+  uint8_t CtoEb = keyArray[0];
+  uint8_t EtoAb = keyArray[1];
+  uint8_t AbtoB = keyArray[2];
+
+  uint16_t CtoB = CtoEb + (EtoAb<<4) + (AbtoB<<8);
+  if (CtoB != 0x0FFF){
+    for(int note = 0 ; note < 12; note++){
+      uint16_t mask = 0x1 << note;
+      if (!(mask & CtoB)){
+        localStepSize = stepSizes[note];
+        break;
+      }else{
+        continue;
+      }
+    }
+  }else{
+    localStepSize = 0;
+  }
+  __atomic_store_n(&currentStepSize, localStepSize, __ATOMIC_RELAXED);
 }
 
-const char* checkKeyPress(uint8_t* keyArray){
+const char* checkNote(){
   const char* notes[] = {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
+  int32_t localStepSize = 0;
 
   uint8_t CtoEb = keyArray[0];
   uint8_t EtoAb = keyArray[1];
@@ -94,21 +118,60 @@ const char* checkKeyPress(uint8_t* keyArray){
 
   uint16_t CtoB = CtoEb + (EtoAb<<4) + (AbtoB<<8);
   const char* res = "None";
-  if (CtoB != 0x0FFF){
-    for(int note = 0 ; note < 12; note++){
-      uint16_t mask = 0x1 << note;
-      if (!(mask & CtoB)){
-        currentStepSize = stepSizes[note];
-        res = notes[note];
-        break;
-      }else{
-        continue;
-      }
+
+  for(int note = 0 ; note < 12; note++){
+    uint16_t mask = 0x1 << note;
+    if (!(mask & CtoB)){
+      res = notes[note];
+      break;
+    }else{
+      continue;
     }
-  }else{
-    currentStepSize = 0;
   }
+
   return res;
+}
+
+void scanKeysTask(void * pvParameters) {
+  // Setting up initiation interval to 50ms
+  const TickType_t xFrequency = 50/portTICK_PERIOD_MS;
+  // Get current time, used in next function call
+  TickType_t xLastWakeTime = xTaskGetTickCount();
+  while (1){
+    //Blocks call until xFrequncy time has passed
+    vTaskDelayUntil( &xLastWakeTime, xFrequency );
+    updateKeyArray();
+    checkKeyPress();
+  }
+}
+
+void updateDisplay(void * pvParameters){
+    //Update display
+    u8g2.clearBuffer();         // clear the internal memory
+    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
+    u8g2.drawStr(2,10,"Hello World!");  // write something to the internal memory
+
+    const char* note = checkNote();
+    u8g2.drawStr(2,30,note);
+    u8g2.setCursor(32,30);
+    u8g2.print(currentStepSize);
+
+    for ( int i = 0; i < 8;i++){
+      u8g2.setCursor(2+(int)i*10,20);
+      u8g2.print(keyArray[i],HEX);
+    }
+    u8g2.sendBuffer();          // transfer internal memory to the display
+
+    //Toggle LED
+    digitalToggle(LED_BUILTIN);
+}
+
+void sampleISR(){
+  static int32_t phaseAcc=0;
+  phaseAcc += currentStepSize;
+  int32_t Vout = phaseAcc >> 24;
+
+  // analogWrite(OUTR_PIN, Vout+128);
 }
 
 
@@ -141,7 +204,30 @@ void setup() {
 
   //Initialise UART
   Serial.begin(9600);
-  Serial.println("Hello World");
+
+  //Creates the Clock instance
+  TIM_TypeDef *Instance = TIM1;
+  HardwareTimer *sampleTimer = new HardwareTimer(Instance);
+  Serial.println("Clock Created");
+
+  //Starts the Clock
+  sampleTimer->setOverflow(22000, HERTZ_FORMAT);
+  sampleTimer->attachInterrupt(sampleISR);
+  sampleTimer->resume();
+  Serial.println("Clock Starts");
+
+  //set up RTOS
+  TaskHandle_t scanKeysHandle = NULL; 
+  xTaskCreate(
+    scanKeysTask, /* Function that implements the task */ 
+    "scanKeys", /* Text name for the task */
+    64, /* Stack size in words, not bytes */ 
+    NULL, /* Parameter passed into the task */
+    1, /* Task priority */
+    &scanKeysHandle /* Pointer to store the task handle */
+  ); 
+
+  vTaskStartScheduler();
 }
 
 void loop() {
@@ -152,37 +238,7 @@ void loop() {
   if (millis() > next) {
     next += interval;
 
-    //Update display
-    u8g2.clearBuffer();         // clear the internal memory
-    u8g2.setFont(u8g2_font_ncenB08_tr); // choose a suitable font
-    u8g2.drawStr(2,10,"Hello World!");  // write something to the internal memory
-    uint8_t *keyArray = new uint8_t[8];
-    updateKeyArray(keyArray);
-    const char* note = checkKeyPress(keyArray);
-    u8g2.drawStr(2,30,note);
-    u8g2.setCursor(32,30);
-    u8g2.print(currentStepSize);
-    uint8_t keys = readCols();
-    for ( int i = 0; i < 8;i++){
-      u8g2.setCursor(2+(int)i*10,20);
-      u8g2.print(keyArray[i],HEX);
-    }
-
-    u8g2.sendBuffer();          // transfer internal memory to the display
-
-    //Toggle LED
-    digitalToggle(LED_BUILTIN);
+    updateDisplay(nullptr);
+  
   }
-}
-
-// handle diagnostic informations given by assertion and abort program execution:
-void __assert(const char *__func, const char *__file, int __lineno, const char *__sexp) {
-    // transmit diagnostic informations through serial link. 
-    Serial.println(__func);
-    Serial.println(__file);
-    Serial.println(__lineno, DEC);
-    Serial.println(__sexp);
-    Serial.flush();
-    // abort program execution.
-    abort();
 }
